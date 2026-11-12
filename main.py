@@ -170,11 +170,11 @@ def main():
 
     # Candidate set: strong at the last mark, recently near the top, or rising.
     cand = {}
-    for r in last_rows[:60]:
+    for r in last_rows[:100]:
         cand[r["mint"]] = True
     for mint, pts in series.items():
         recent = [lc for i, lc in pts if i >= len(marks) - 3]
-        if recent and max(recent) >= place_caps[-1] - 0.45:
+        if recent and max(recent) >= place_caps[-1] - 0.7:
             cand[mint] = True
     for mint in list(cand):
         pts = series[mint]
@@ -208,10 +208,23 @@ def main():
         vol_scale = 0.75 + 0.6 * min(2.0, v / med_vol) if med_vol > 0 else 1.0
         sigma = (0.34 + 0.30 * math.sqrt(horizon_h)) * vol_scale
         sigma = max(0.30, min(1.45, sigma))
-        coins.append((mint, mu, sigma, last_rank.get(mint, 999)))
+        # Crash hazard: with probability stay_p the coin simply holds near
+        # its cap (small noise, partial drift); otherwise it takes the full
+        # diffuse move above. Graduated, complete coins are stickier. The
+        # stay probability decays with the horizon, so at long horizons the
+        # model is nearly pure diffusion again.
+        tau = 2.2
+        if info[mint].get("venue") == "pool":
+            tau *= 1.5
+        if info[mint].get("complete"):
+            tau *= 1.25
+        stay_p = math.exp(-horizon_h / tau)
+        mu_stay = last_lc + 0.3 * move
+        sig_stay = 0.16 + 0.05 * math.sqrt(horizon_h)
+        coins.append((mint, mu, sigma, last_rank.get(mint, 999), stay_p, mu_stay, sig_stay))
     # Keep the strongest candidates by mu so the simulation stays fast.
     coins.sort(key=lambda c: -c[1])
-    coins = coins[:48]
+    coins = coins[:56]
 
     # ---- phantom newcomers ---------------------------------------------------
     delta_new = 0.45 - 0.035 * window_age_h - 0.10 * math.log10(1.0 + horizon_h)
@@ -231,6 +244,9 @@ def main():
     exp_rank = [0.0] * n_all
     mus = [c[1] for c in coins] + [p[0] for p in phantoms]
     sigs = [c[2] for c in coins] + [p[1] for p in phantoms]
+    stays = [c[4] for c in coins] + [0.0] * len(phantoms)
+    mus_stay = [c[5] for c in coins] + [p[0] for p in phantoms]
+    sigs_stay = [c[6] for c in coins] + [p[1] for p in phantoms]
 
     def bin_index(x):
         b = 0
@@ -242,7 +258,12 @@ def main():
         return b
 
     for _ in range(DRAWS):
-        draws = [(mus[i] + sigs[i] * rng.normal(), i) for i in range(n_all)]
+        draws = []
+        for i in range(n_all):
+            if stays[i] > 0.0 and rng.uniform() < stays[i]:
+                draws.append((mus_stay[i] + sigs_stay[i] * rng.normal(), i))
+            else:
+                draws.append((mus[i] + sigs[i] * rng.normal(), i))
         draws.sort(key=lambda t: -t[0])
         for k in range(places):
             val, idx = draws[k]
@@ -268,10 +289,10 @@ def main():
     probabilities = []
     for k in range(places):
         rows = []
-        for ci, (mint, mu, sigma, lr) in enumerate(coins):
+        for ci, c in enumerate(coins):
             p = place_hits[k][ci] / DRAWS
             if p >= 0.004:
-                rows.append((mint, round(p, 6)))
+                rows.append((c[0], round(p, 6)))
         # Prune rows that pay less than the implied unnamed share would.
         for _ in range(3):
             named = len(rows)
@@ -310,16 +331,23 @@ def main():
         sim_sd = math.sqrt(sim_var)
         trend_cap = place_caps[k] + place_slopes[k] * horizon_h
         mean_k = 0.5 * sim_mean + 0.5 * trend_cap
-        sd_k = max(0.42, min(1.0, 0.55 * sim_sd))
+        sd_floor = 0.50 if window_age_h < 3.0 else 0.42
+        sd_k = max(sd_floor, min(1.0, 0.55 * sim_sd))
+        # While the field is still expanding fast, part of the mass rides a
+        # second, higher centre: the frenzy continuing, not stopping at the cut.
+        exp_w = 0.30 if market_slope > 0.15 else 0.0
+        mean_hi = mean_k + 1.2 * market_slope * horizon_h
 
-        def cdf(x, mu=mean_k, sd=sd_k):
+        def cdf(x, mu, sd):
             return 0.5 * (1.0 + math.erf((x - mu) / (sd * math.sqrt(2.0))))
 
         mix = []
         for b in range(nbins):
             lo = edges[b - 1] if b > 0 else mean_k - 8 * sd_k
             hi = edges[b] if b < nbins - 1 else mean_k + 8 * sd_k
-            np_ = max(0.0, cdf(hi) - cdf(lo))
+            np_ = (1.0 - exp_w) * max(0.0, cdf(hi, mean_k, sd_k) - cdf(lo, mean_k, sd_k))
+            if exp_w > 0.0:
+                np_ += exp_w * max(0.0, cdf(hi, mean_hi, sd_k) - cdf(lo, mean_hi, sd_k))
             hp = 0.5 * hist[b]
             if b > 0:
                 hp += 0.25 * hist[b - 1]
