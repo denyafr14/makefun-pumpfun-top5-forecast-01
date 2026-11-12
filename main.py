@@ -247,9 +247,19 @@ def main():
         for k in range(places):
             val, idx = draws[k]
             place_hits[k][idx] += 1
-            bin_hits[k][bin_index(val)] += 1
-            cap_sum[k] += val
-            cap_sq[k] += val * val
+        # Size moments come from real coins only: the k-th real coin's cap in
+        # this draw. Phantom caps are a modelling device for *who* holds a
+        # place, not a measurement of how large places get; the field's cap
+        # trend (below) carries the level instead.
+        seen = 0
+        for val, idx in draws:
+            if idx < len(coins):
+                bin_hits[seen][bin_index(val)] += 1
+                cap_sum[seen] += val
+                cap_sq[seen] += val * val
+                seen += 1
+                if seen == places:
+                    break
         for r_idx, (val, idx) in enumerate(draws[:places]):
             top5_hits[idx] += 1
             exp_rank[idx] += r_idx + 1
@@ -287,18 +297,20 @@ def main():
                 break
 
     # ---- sizes ---------------------------------------------------------------
-    # The place cap's distribution: a normal fitted to the simulation's own
-    # place-cap moments (mean captures drift, risers and phantom lift; the sd
-    # is shrunk, since an order statistic is steadier than a single coin),
-    # mixed with the raw simulated histogram for shape and tails.
+    # The place cap's distribution: a normal centred halfway between the
+    # simulation's real-coin place-cap mean and the place's current cap
+    # extrapolated by its own trend across the history (the field's caps
+    # trend hard, especially while the window is young), with a wide,
+    # sim-scaled sd; mixed with the simulated histogram for shape and tails.
     sizes = []
     for k in range(places):
         hist = [bin_hits[k][b] / DRAWS for b in range(nbins)]
         sim_mean = cap_sum[k] / DRAWS
         sim_var = max(0.0, cap_sq[k] / DRAWS - sim_mean * sim_mean)
         sim_sd = math.sqrt(sim_var)
-        mean_k = 0.75 * sim_mean + 0.25 * (place_caps[k] + place_slopes[k] * horizon_h)
-        sd_k = max(0.30, min(0.95, 0.50 * sim_sd))
+        trend_cap = place_caps[k] + place_slopes[k] * horizon_h
+        mean_k = 0.5 * sim_mean + 0.5 * trend_cap
+        sd_k = max(0.42, min(1.0, 0.55 * sim_sd))
 
         def cdf(x, mu=mean_k, sd=sd_k):
             return 0.5 * (1.0 + math.erf((x - mu) / (sd * math.sqrt(2.0))))
@@ -313,7 +325,7 @@ def main():
                 hp += 0.25 * hist[b - 1]
             if b < nbins - 1:
                 hp += 0.25 * hist[b + 1]
-            mix.append(0.8 * np_ + 0.2 * hp)
+            mix.append(0.85 * np_ + 0.15 * hp)
         # Name every bin: the cap must land somewhere, and an unnamed bin
         # would only receive the thin shared remainder.
         total = sum(mix)
